@@ -5,7 +5,6 @@ import re
 import os
 import logging
 
-
 # TODO - Probably use contexts in the future
 # TODO - Arguments for file type output
 
@@ -24,7 +23,10 @@ class CISConverter:
         self.metrics_total = 0
         self.metrics_good = 0
 
-    searcher = re.compile(f'^(?P<cisnum>[\.\d]+)(?:\s+\((?P<level>[\w\d]+)\))?(?:\s+(?P<policy>.+))(?:\s\((?P<scored>Not\ Scored|Scored|Manual|Automated)\)\s?)$')
+    searcher = re.compile(f'^?(?P<cisnum>\d+\.[\.\d]+)(?:\s+\((?P<level>[\w\d]+)\))?(?:\s+(?P<policy>.+))(?:\s*\((?P<scored>Not\ Scored|Scored|Manual|Automated)\)\s*)$')
+    section_start_searcher = re.compile(f'^?(?P<cisnum>\d+\.[\.\d]+)(?:\s+\((?P<level>[\w\d]+)\))?')
+    section_end_searcher = re.compile(f'\((Not\ Scored|Scored|Manual|Automated)\)\s*$')
+    before_recommendations_searcher = re.compile(f'^Recommendations\n$')
 
     garbage_list = [
         '| P a g e'
@@ -61,32 +63,74 @@ class CISConverter:
             'Audit': '',
             'Remediation': '',
             'Impact': '',
+            'Has impact': False,
             'Default Value': '',
             'References': '',
-            'CIS Controls': ''
+            'CIS Controls': '',
+            'GP templates': []        
         }
 
     def write_row(self, row):
         logging.debug(row)
-
+        
     def parse_text(self):
-        with open(self.args.inputFilePath, mode='rt', encoding='utf8') as inFile:
+        os.system(f"pdftotext {self.args.inputFilePath} convertedtotext.txt")
+        
+        with open("convertedtotext.txt", mode='rt', encoding="utf8") as inFile:
             logging.info(f'Parsing {self.args.inputFilePath}')
+            os.system("rm convertedtotext.txt")
 
+            before_recommendations = True
+            section_header_text = ''
+            section_header_scanning = False
             row = None
             cur_mode = None
             force_write = False
-
+            empty_line_added = False
             self.write_header()
-
+            found_sections = []
+            # how many modes are found already
+            modes_found = 0
+            header_lines_count = 0
+            
             for line in inFile:
+                # line = line.decode("utf-8")
+                if before_recommendations:
+                    if CISConverter.before_recommendations_searcher.match(line):
+                        before_recommendations = False
+                    else:
+                        continue
+
                 # line = line.replace('\n', '')
+                line = line.strip()
                 logging.debug(f'Line: "{line}"')
                 self.metrics_total += 1
                 # line = line.strip()
                 # Skip garbage lines here
                 if any(ele in line for ele in CISConverter.garbage_list):
                     continue
+
+                # most of the modes should be presented already
+                if modes_found > len(self.modes)-3 or modes_found == 0:
+                    if len(line.strip())==0 or header_lines_count>3:
+                           # header should not contain empty lines or longer then 5 lines, start over again
+                           section_header_text = ''
+                           header_lines_count = 0
+                           continue
+                    match = CISConverter.section_start_searcher.search(line)
+                    if match:
+                        section_header_text = ''
+                        section_header_scanning = True
+                    if section_header_scanning:
+                        section_header_text += line
+                        header_lines_count += 1
+                        match = CISConverter.section_end_searcher.search(line)
+                        if match:
+                            section_header_scanning = False
+                            line = section_header_text.replace('\n','')
+                            header_lines_count = 0
+                        else:
+                            continue
 
                 match = CISConverter.searcher.match(line)
                 if match or force_write:
@@ -97,15 +141,19 @@ class CISConverter:
                                 row['Type'] = row['Profile Applicability'][0]
                             else:
                                 row['Type'] = 'See Profile Applicability'
+                        row['Has impact'] = row['Impact'].find("None - this is the default behavior")==-1
+                        row['GP templates'] = re.findall(r'(\w+\.admx(?:\/\w+)?)', row['Remediation'])
                         for key in row.keys():
                             if isinstance(row[key], list):
                                 row[key] = '\n'.join(row[key])
+                        modes_found = 0 # start over finding all the modes
                         self.write_row(row)
 
                         self.metrics_good += 1
                         if force_write:
                             break
                     row = self.build_blank()
+                    found_sections = []
                     row['Benchmark'] = os.path.basename(self.args.inputFilePath)[:-4]
                     row['CIS #'] = match.group('cisnum')
                     row['Type'] = match.group('level')
@@ -117,12 +165,17 @@ class CISConverter:
                 else:
                     mode_set = False
                     for mode in CISConverter.modes:
-                        if line.startswith(f'{mode}:'):
+                        if re.match(f'^?{mode}:\s*$', line):
                             cur_mode = mode
+                            if mode in found_sections:
+                                logging.error("section {} overflows the following one: {}".format(mode, row['CIS #']))
+                                exit(1)
+                            found_sections.append(mode)
                             mode_set = True
+                            modes_found += 1
 
                     # Only do something on the line(s) after a mode set
-                    if not mode_set and cur_mode:
+                    if not mode_set and cur_mode and row:
                         # # Perform sanitization here.
                         if cur_mode == 'Profile Applicability':
                             line = line.replace('\uf0b7 ', '', 1)
@@ -134,7 +187,9 @@ class CISConverter:
                             continue
 
                         if isinstance(row[cur_mode], str):
-                            row[cur_mode] += line
+                            if len(line.strip()) > 0 or not empty_line_added:
+                                row[cur_mode] += line
+                            empty_line_added = len(line.strip()) == 0 
                         elif isinstance(row[cur_mode], list):
                             row[cur_mode].append(line.strip())
                         else:
